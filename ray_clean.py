@@ -4,8 +4,12 @@ import yaml
 import pandas as pd
 import ray
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
+
+# Enable Ray's progress bars
+ray.data.DataContext.get_current().enable_rich_progress_bars = True
 
 # load config
 with open("config.yaml", "r") as f:
@@ -34,14 +38,18 @@ t0 = time.time()
 print("\n1. Ingesting parquet files...")
 
 parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".parquet")]
+print(f"   Found {len(parquet_files)} parquet files")
+print("   Reading parquet files...")
 trip_ds = ray.data.read_parquet(parquet_files, override_num_blocks=256)
+print("   Counting rows...")
 initial_count = trip_ds.count()
-print(f"loaded {initial_count} rows")
+print(f"✓ Loaded {initial_count} rows")
 timings["ingestion"] = time.time() - t0
 
 # CLEANSING
 t0 = time.time()
 print("\n2. Cleansing data...")
+print("   Removing nulls, duplicates, and filtering bad data...")
 
 key_cols = ["tpep_pickup_datetime", "tpep_dropoff_datetime", "trip_distance", "PULocationID", "DOLocationID", "fare_amount"]
 
@@ -64,8 +72,9 @@ def clean_batch(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 trip_ds = trip_ds.map_batches(clean_batch, batch_format="pandas", num_cpus=2, batch_size=2048)
+print("   Counting cleaned rows...")
 cleaned_count = trip_ds.count()
-print(f"  after cleaning: {cleaned_count} rows (removed {initial_count - cleaned_count})")
+print(f"✓ After cleaning: {cleaned_count} rows (removed {initial_count - cleaned_count:,})")
 timings["cleansing"] = time.time() - t0
 
 # TRANSFORMATION
@@ -73,7 +82,9 @@ t0 = time.time()
 print("\n3. Transforming data...")
 
 # load zone lookup
+print("   Loading zone lookup table...")
 zone_df = pd.read_csv(zone_file)
+print(f"   Loaded {len(zone_df)} zones")
 
 # put zone_df in object store so all workers can access it
 zone_ref = ray.put(zone_df)
@@ -97,6 +108,7 @@ def transform_batch(df: pd.DataFrame, zone_data=None) -> pd.DataFrame:
 
     return df
 
+print("   Enriching with location data...")
 trip_ds = trip_ds.map_batches(
     lambda batch: transform_batch(batch, zone_data=ray.get(zone_ref)),
     batch_format="pandas",
@@ -106,6 +118,7 @@ trip_ds = trip_ds.map_batches(
 
 # UDF for avg speed
 udf_start = time.time()
+print("   Calculating speed metrics...")
 
 def calc_speed_batch(df):
     duration = (df["dropoff_datetime"] - df["pickup_datetime"]).dt.total_seconds() / 3600.0
@@ -116,24 +129,26 @@ def calc_speed_batch(df):
     return df
 
 trip_ds = trip_ds.map_batches(calc_speed_batch, batch_format="pandas", num_cpus=2, batch_size=2048)
+print("   Finalizing dataset...")
 final_count = trip_ds.count()
 
 udf_time = time.time() - udf_start
 timings["transformation"] = time.time() - t0
 timings["udf_overhead"] = udf_time
 
-print(f"final row count: {final_count}")
-print(f"UDF execution time: {udf_time:.2f}s")
+print(f"✓ Final row count: {final_count}")
+print(f"  UDF execution time: {udf_time:.2f}s")
 
 # EXPORT
 t0 = time.time()
 print("\n4. Exporting to parquet...")
 
 os.makedirs(output_path, exist_ok=True)
+print(f"   Writing {final_count:,} rows to {output_path}...")
 trip_ds.write_parquet(output_path)
+print(f"✓ Saved successfully")
 
 timings["export"] = time.time() - t0
-print(f"saved to: {output_path}")
 
 # print summary
 total = sum(timings.values())
