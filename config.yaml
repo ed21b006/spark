@@ -1,0 +1,29 @@
+# dataset config
+dataset:
+  base_url: "https://d37ci6vzurychx.cloudfront.net/trip-data"
+  zone_lookup_url: "https://d37ci6vzurychx.cloudfront.net/misc/taxi+_zone_lookup.csv"
+  months:
+    - "2023-01"
+    - "2023-02"
+    - "2023-03"
+    - "2023-04"
+    - "2023-05"
+    - "2023-06"
+    # - "2023-07"
+    # - "2023-08"
+    # - "2023-09"
+    # - "2023-10"
+    # - "2023-11"
+    # - "2023-12"
+
+# paths
+paths:
+  data_dir: "data"
+  output_dir: "output"
+  zone_lookup_file: "data/taxi_zone_lookup.csv"
+  spark_output: "output/spark_cleaned"
+  ray_output: "output/ray_cleaned"
+
+# cluster config (used when running in cluster mode)
+cluster:
+  mode: "cluster"  # "local" or "cluster"
