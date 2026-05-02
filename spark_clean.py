@@ -4,16 +4,26 @@ import yaml
 import pandas as pd
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_timestamp, unix_timestamp, udf, hour, when
-from pyspark.sql.types import DoubleType, StructType, StructField, TimestampType, LongType
+from pyspark.sql.functions import col, to_timestamp, udf, hour
+from pyspark.sql.types import DoubleType
 
 load_dotenv()
 
-# load config
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
+# load config (fallback to sensible defaults for dry-run/testing)
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    config = {
+        "cluster": {"mode": "local"},
+        "paths": {
+            "data_dir": "data",
+            "zone_lookup_file": "data/taxi_zone_lookup.csv",
+            "spark_output": "output/spark_cleaned"
+        }
+    }
 
-cluster_mode = config["cluster"]["mode"]
+cluster_mode = config.get("cluster", {}).get("mode", "local")
 
 if cluster_mode == "cluster":
     common_base = "/tmp/assignment8"
@@ -30,8 +40,31 @@ else:
 
 spark_master = os.getenv("SPARK_MASTER_URL", "local[*]")
 
-# use local mode if not in cluster mode
-master_url = spark_master if cluster_mode == "cluster" else "local[*]"
+# simple resource calc (80% of available)
+total_cpus = os.cpu_count() or 1
+cpus_to_use = max(1, int(total_cpus * 0.8))
+
+def _get_mem_gb():
+    try:
+        with open("/proc/meminfo") as f:
+            for l in f:
+                if l.startswith("MemTotal"):
+                    kb = int(l.split()[1])
+                    gb = max(1, int(kb / 1024 / 1024 * 0.8))
+                    return gb
+    except Exception:
+        return 1
+
+mem_gb = _get_mem_gb()
+
+# local master uses limited cores for parity; in cluster mode rely on SPARK_MASTER_URL
+master_url = spark_master if cluster_mode == "cluster" else f"local[{cpus_to_use}]"
+
+# support quick dry-run to inspect resource choices
+import sys
+if "--dry-run" in sys.argv:
+    print(f"cpus_to_use={cpus_to_use}, mem_gb={mem_gb}, master_url={master_url}")
+    sys.exit(0)
 
 print(f"Starting Spark pipeline (mode: {cluster_mode}, master: {master_url})")
 timings = {}
@@ -41,10 +74,10 @@ spark = SparkSession.builder \
     .appName("NYC_Taxi_Cleaning") \
     .master(master_url) \
     .config("spark.python.worker.faulthandler.enabled", "true") \
-    .config("spark.driver.memory", "4g") \
-    .config("spark.executor.memory", "4g") \
-    .config("spark.executor.memoryOverhead", "1g") \
-    .config("spark.network.timeout", "800s") \
+    .config("spark.driver.memory", f"{mem_gb}g") \
+    .config("spark.executor.memory", f"{mem_gb}g") \
+    .config("spark.executor.memoryOverhead", "512m") \
+    .config("spark.executor.cores", str(cpus_to_use)) \
     .getOrCreate()
 
 # INGESTION

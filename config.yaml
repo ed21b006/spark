@@ -26,4 +26,4 @@ paths:
 
 # cluster config (used when running in cluster mode)
 cluster:
-  mode: "cluster"  # "local" or "cluster"
+  mode: "local"  # "local" or "cluster"
