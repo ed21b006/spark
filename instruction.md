@@ -72,7 +72,7 @@ $SPARK_HOME/bin/spark-class org.apache.spark.deploy.master.Master
 export SPARK_HOME=$(python -c "import os, pyspark; print(os.path.dirname(pyspark.__file__))")
 
 # start worker, connecting to my master (runs in foreground)
-$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker spark://<MY_IP>:7077
+$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker spark://192.168.0.109:7077
 
 # verify on master UI - should show 2 workers
 ```

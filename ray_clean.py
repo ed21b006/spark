@@ -1,126 +1,107 @@
 import os
+import sys
 import time
 import yaml
 import pandas as pd
 import ray
 from dotenv import load_dotenv
-from tqdm import tqdm
 
 load_dotenv()
 
-# Enable Ray's progress bars
-ray.data.DataContext.get_current().enable_rich_progress_bars = True
+# load config with sensible defaults
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    config = {
+        "cluster": {"mode": "local"},
+        "paths": {
+            "data_dir": "data",
+            "zone_lookup_file": "data/taxi_zone_lookup.csv",
+            "ray_output": "output/ray_cleaned"
+        }
+    }
 
-# load config
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
-
-data_dir = config["paths"]["data_dir"]
-zone_file = config["paths"]["zone_lookup_file"]
-output_path = config["paths"]["ray_output"]
-cluster_mode = config["cluster"]["mode"]
-
+data_dir = config.get("paths", {}).get("data_dir")
+zone_file = config.get("paths", {}).get("zone_lookup_file")
+output_path = config.get("paths", {}).get("ray_output")
+cluster_mode = config.get("cluster", {}).get("mode", "local")
 ray_address = os.getenv("RAY_HEAD_ADDRESS", "auto")
+
+# resource calculations (80% of local resources)
+total_cpus = os.cpu_count() or 1
+cpus_to_use = max(1, int(total_cpus * 0.8))
+per_task_cpus = max(1, cpus_to_use // 4)
+
+def _get_mem_bytes():
+    try:
+        with open("/proc/meminfo") as f:
+            for l in f:
+                if l.startswith("MemTotal"):
+                    kb = int(l.split()[1])
+                    return int(kb * 1024 * 0.8)
+    except Exception:
+        return None
+
+mem_bytes = _get_mem_bytes()
+
+if "--dry-run" in sys.argv:
+    print(f"cpus_to_use={cpus_to_use}, mem_bytes={mem_bytes}, per_task_cpus={per_task_cpus}")
+    sys.exit(0)
 
 # init ray
 if cluster_mode == "cluster":
     print(f"Connecting to Ray cluster at: {ray_address}")
     ray.init(address=ray_address)
 else:
-    print("Starting Ray in local mode")
-    ray.init()
+    ray.init(num_cpus=cpus_to_use)
 
 print(f"Ray cluster resources: {ray.cluster_resources()}")
-timings = {}
 
 # INGESTION
-t0 = time.time()
 print("\n1. Ingesting parquet files...")
-
 parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".parquet")]
-print(f"   Found {len(parquet_files)} parquet files")
-print("   Reading parquet files...")
-trip_ds = ray.data.read_parquet(parquet_files, override_num_blocks=256)
-print("   Counting rows...")
+print(f"  Found {len(parquet_files)} parquet files")
+trip_ds = ray.data.read_parquet(parquet_files, override_num_blocks=max(16, cpus_to_use * 4))
 initial_count = trip_ds.count()
-print(f"✓ Loaded {initial_count} rows")
-timings["ingestion"] = time.time() - t0
+print(f"  Loaded {initial_count} rows")
 
 # CLEANSING
-t0 = time.time()
 print("\n2. Cleansing data...")
-print("   Removing nulls, duplicates, and filtering bad data...")
-
 key_cols = ["tpep_pickup_datetime", "tpep_dropoff_datetime", "trip_distance", "PULocationID", "DOLocationID", "fare_amount"]
 
 def clean_batch(df: pd.DataFrame) -> pd.DataFrame:
-    # drop nulls in key columns
     df = df.dropna(subset=key_cols)
-
-    # remove duplicates
     df = df.drop_duplicates()
-
-    # filter bad data
     df = df[df["trip_distance"] > 0]
     df = df[df["fare_amount"] >= 0]
     df = df[df["tpep_dropoff_datetime"] > df["tpep_pickup_datetime"]]
-
-    # ensure timestamp types
     df["pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
     df["dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"])
-
     return df
 
-trip_ds = trip_ds.map_batches(clean_batch, batch_format="pandas", num_cpus=2, batch_size=2048)
-print("   Counting cleaned rows...")
+trip_ds = trip_ds.map_batches(clean_batch, batch_format="pandas", num_cpus=per_task_cpus, batch_size=2048)
 cleaned_count = trip_ds.count()
-print(f"✓ After cleaning: {cleaned_count} rows (removed {initial_count - cleaned_count:,})")
-timings["cleansing"] = time.time() - t0
+print(f"  After cleaning: {cleaned_count} rows (removed {initial_count - cleaned_count:,})")
 
 # TRANSFORMATION
-t0 = time.time()
 print("\n3. Transforming data...")
-
-# load zone lookup
-print("   Loading zone lookup table...")
 zone_df = pd.read_csv(zone_file)
-print(f"   Loaded {len(zone_df)} zones")
-
-# put zone_df in object store so all workers can access it
 zone_ref = ray.put(zone_df)
 
 def transform_batch(df: pd.DataFrame, zone_data=None) -> pd.DataFrame:
-    # join - pickup location
-    zone = zone_data.rename(columns={
-        "LocationID": "PULocationID",
-        "Borough": "pickup_borough",
-        "Zone": "pickup_zone"
-    })[["PULocationID", "pickup_borough", "pickup_zone"]]
+    zone = zone_data.rename(columns={"LocationID": "PULocationID", "Borough": "pickup_borough", "Zone": "pickup_zone"})[["PULocationID", "pickup_borough", "pickup_zone"]]
     df = df.merge(zone, on="PULocationID", how="left")
-
-    # join - dropoff location
-    zone_do = zone_data.rename(columns={
-        "LocationID": "DOLocationID",
-        "Borough": "dropoff_borough",
-        "Zone": "dropoff_zone"
-    })[["DOLocationID", "dropoff_borough", "dropoff_zone"]]
+    zone_do = zone_data.rename(columns={"LocationID": "DOLocationID", "Borough": "dropoff_borough", "Zone": "dropoff_zone"})[["DOLocationID", "dropoff_borough", "dropoff_zone"]]
     df = df.merge(zone_do, on="DOLocationID", how="left")
-
     return df
 
-print("   Enriching with location data...")
-trip_ds = trip_ds.map_batches(
-    lambda batch: transform_batch(batch, zone_data=ray.get(zone_ref)),
-    batch_format="pandas",
-    num_cpus=2,
-    batch_size=2048
-)
+trip_ds = trip_ds.map_batches(lambda b: transform_batch(b, zone_data=ray.get(zone_ref)), batch_format="pandas", num_cpus=per_task_cpus, batch_size=2048)
 
-# UDF for avg speed
-udf_start = time.time()
-print("   Calculating speed metrics...")
+# UDF
+print("\n4. Calculating speed metrics...")
 
-def calc_speed_batch(df):
+def calc_speed_batch(df: pd.DataFrame) -> pd.DataFrame:
     duration = (df["dropoff_datetime"] - df["pickup_datetime"]).dt.total_seconds() / 3600.0
     df["avg_speed_mph"] = df["trip_distance"] / duration
     df.loc[duration <= 0, "avg_speed_mph"] = None
@@ -128,36 +109,16 @@ def calc_speed_batch(df):
     df = df[(df["avg_speed_mph"].isna()) | (df["avg_speed_mph"] <= 100)]
     return df
 
-trip_ds = trip_ds.map_batches(calc_speed_batch, batch_format="pandas", num_cpus=2, batch_size=2048)
-print("   Finalizing dataset...")
+trip_ds = trip_ds.map_batches(calc_speed_batch, batch_format="pandas", num_cpus=per_task_cpus, batch_size=2048)
 final_count = trip_ds.count()
-
-udf_time = time.time() - udf_start
-timings["transformation"] = time.time() - t0
-timings["udf_overhead"] = udf_time
-
-print(f"✓ Final row count: {final_count}")
-print(f"  UDF execution time: {udf_time:.2f}s")
+print(f"  Final row count: {final_count}")
 
 # EXPORT
-t0 = time.time()
-print("\n4. Exporting to parquet...")
-
+print("\n5. Exporting to parquet...")
 os.makedirs(output_path, exist_ok=True)
-print(f"   Writing {final_count:,} rows to {output_path}...")
 trip_ds.write_parquet(output_path)
-print(f"✓ Saved successfully")
+print(f"  Saved to {output_path}")
 
-timings["export"] = time.time() - t0
-
-# print summary
-total = sum(timings.values())
-timings["total"] = total
-print("\n" + "=" * 50)
-print("RAY PIPELINE TIMING SUMMARY")
-print("=" * 50)
-for step, t in timings.items():
-    print(f"{step:20s}: {t:8.2f}s")
-print("=" * 50)
-
+# SUMMARY
+print("\nPipeline complete")
 ray.shutdown()
