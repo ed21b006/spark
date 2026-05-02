@@ -127,7 +127,7 @@ ray start --head --port=6379 --dashboard-host=0.0.0.0
 ### On Friend's Laptop (Worker Node)
 ```bash
 # join my ray cluster
-ray start --address=<MY_IP>:6379
+ray start --address=192.168.0.117:6379
 ```
 
 ### Verify
