@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
@@ -212,5 +213,11 @@ print("=" * 50)
 for step, t in timings.items():
     print(f"  {step:20s}: {t:8.2f}s")
 print("=" * 50)
+
+# SAVE TIMINGS TO JSON
+json_filename = "spark_timings.json"
+with open(json_filename, "w") as f:
+    json.dump(timings, f, indent=4)
+print(f"Timings successfully saved to {os.path.abspath(json_filename)}")
 
 spark.stop()
